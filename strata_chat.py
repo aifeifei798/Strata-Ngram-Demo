@@ -23,7 +23,9 @@ decoding 的 draft 源,由主模型整批验证 —— 输出与不开 draft 完
 """
 
 import argparse
+import mmap
 import os
+import struct
 import time
 from threading import Thread
 
@@ -41,11 +43,13 @@ DEFAULT_MODEL = "../LFM3-VL-2B"  # 本地模型目录,或 HF hub id(如 LiquidAI
 DEFAULT_IMAGE = ""  # 想让首轮看图,--image 传本地图片路径
 DEFAULT_TEXT = "你好,用中文简单介绍一下你自己,两句话就行"
 TABLE_PATH = "strata_ngram.bin"
+TRI_TABLE_PATH = "strata_tri_ngram.bin"
 HEADER_SIZE = 24  # struct("<8sIIQ") = 8s magic + I + I + Q
 
 NEW_STATS = lambda: {"prompt_rounds": 0, "table_rounds": 0, "table_refills": 0,
                      "drafted_rounds": 0, "draft_tokens": 0,
                      "verified_tokens": 0, "verify_rounds": 0,
+                     "tri_steps": 0, "bi_steps": 0,
                      "rows_read": 0, "query_time": 0.0}
 
 
@@ -107,11 +111,9 @@ def file_rss_bytes(path: str) -> int:
 # SSD 上的 n-gram 表:mmap 映射,不占显存、零拷贝,按行按需读
 # ---------------------------------------------------------------------------
 class StrataTable:
-    def __init__(self, path: str, io: str = "mmap"):
-        import mmap
-        import os
-        import struct
+    label = "bigram 表"
 
+    def __init__(self, path: str, io: str = "mmap"):
         self.rows_read = 0
         self.query_time = 0.0
         size = os.path.getsize(path)
@@ -161,29 +163,78 @@ class StrataTable:
         return 0 if self.mode == "ram" else file_rss_bytes(self.path)
 
 
+class TriTable:
+    """trigram(二阶)表:key = (前两 token) 的组合,按 key 排序存储,查询 = 二分。
+    组合空间是词表^2,没法像 bigram 那样按行号直接索引;每次查询读 log2(n) 个页,
+    正好对应 Strata 的 "read a few rows per token"。"""
+    label = "trigram 表"
+
+    def __init__(self, path: str):
+        self.rows_read = 0
+        self.query_time = 0.0
+        with open(path, "rb") as f:
+            magic, vocab, n, data_offset = struct.unpack("<8sIIQ", f.read(HEADER_SIZE))
+        if magic != b"STRTBL21":
+            raise ValueError(f"{path} 不是有效的 trigram 表(magic={magic!r})")
+        self.vocab, self.n, self.path = vocab, n, path
+        self.mode, self.size_bytes = "mmap", os.path.getsize(path)
+        self._file = open(path, "rb")
+        self._mm = mmap.mmap(self._file.fileno(), 0, prot=mmap.PROT_READ)
+        self.keys = np.frombuffer(self._mm, dtype="<u8", count=n, offset=data_offset)
+        self.nexts = np.frombuffer(self._mm, dtype="<u4", count=n, offset=data_offset + n * 8)
+
+    def next_token(self, t2: int, t1: int) -> int | None:
+        """二分查 (t2,t1) 的 top-1 后继;未登录返回 None。
+        标量必须转 np.uint64:NEP 50 下 uint64 数组与 Python int 比较会触发
+        类型提升,searchsorted 退化成全表扫描(实测慢 330 倍)。"""
+        t0 = time.perf_counter()
+        key = t2 * self.vocab + t1
+        idx = int(np.searchsorted(self.keys, np.uint64(key)))
+        hit = idx < self.n and int(self.keys[idx]) == key
+        self.rows_read += 1
+        self.query_time += time.perf_counter() - t0
+        return int(self.nexts[idx]) if hit else None
+
+    def drop_cache(self):
+        fd = os.open(self.path, os.O_RDONLY)
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+
+    def resident_bytes(self) -> int:
+        return file_rss_bytes(self.path)
+
+
 # ---------------------------------------------------------------------------
 # draft 生成器:prompt-lookup 优先(上下文里找重复段),不够长用 SSD 表链式补足
 # ---------------------------------------------------------------------------
 class StrataCandidateGenerator(PromptLookupCandidateGenerator):
-    def __init__(self, *args, table: StrataTable, stats: dict, **kwargs):
+    def __init__(self, *args, table: StrataTable, stats: dict, tri: TriTable | None = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.table = table
+        self.tri = tri
         self.stats = stats
 
     def _sync_stats(self):
-        self.stats["rows_read"] = self.table.rows_read
-        self.stats["query_time"] = self.table.query_time
+        self.stats["rows_read"] = self.table.rows_read + (self.tri.rows_read if self.tri else 0)
+        self.stats["query_time"] = self.table.query_time + (self.tri.query_time if self.tri else 0.0)
 
-    def _chain_from_table(self, start_token: int, max_len: int) -> list[int]:
-        """从 start_token 开始,每步查一行取 top-1,链式拼出最多 max_len 个 draft。"""
+    def _chain_from_table(self, prev2: int, prev1: int, max_len: int) -> list[int]:
+        """链式 draft:每步优先查 trigram(看前两个 token),查不到退回 bigram top-1。"""
         draft: list[int] = []
-        cur = start_token
         for _ in range(max_len):
-            nxt = self.table.next_tokens(cur, 1)
-            if not nxt:
-                break
-            draft.append(nxt[0])
-            cur = nxt[0]
+            nxt = self.tri.next_token(prev2, prev1) if self.tri is not None else None
+            if nxt is not None:
+                self.stats["tri_steps"] += 1
+            else:
+                got = self.table.next_tokens(prev1, 1)
+                if not got:
+                    break
+                nxt = got[0]
+                self.stats["bi_steps"] += 1
+            draft.append(nxt)
+            prev2, prev1 = prev1, nxt
         if self.eos_token_id is not None and draft:
             eos = self.eos_token_id.detach().flatten().to("cpu", torch.long)
             hit = torch.nonzero(torch.isin(torch.tensor(draft, dtype=torch.long), eos))
@@ -193,18 +244,21 @@ class StrataCandidateGenerator(PromptLookupCandidateGenerator):
 
     def get_candidates(self, input_ids, **kwargs):
         out, scores = super().get_candidates(input_ids, **kwargs)  # prompt-lookup 优先
+        t2 = int(input_ids[0, -2]) if input_ids.shape[1] >= 2 else int(input_ids[0, -1])
+        t1 = int(input_ids[0, -1])
         if out.shape[1] > input_ids.shape[1]:
             self.stats["prompt_rounds"] += 1
             # 上下文里抄到的续写不足额时,用表从段尾接着往下补
             shortfall = self.num_output_tokens - (out.shape[1] - input_ids.shape[1])
             if shortfall > 0:
-                extra = self._chain_from_table(int(out[0, -1]), shortfall)
+                extra = self._chain_from_table(int(out[0, -2]) if out.shape[1] >= 2 else t1,
+                                               int(out[0, -1]), shortfall)
                 if extra:
                     self.stats["table_refills"] += 1
                     extra_t = torch.tensor([extra], device=input_ids.device, dtype=input_ids.dtype)
                     out = torch.cat((out, extra_t), dim=1)
         else:
-            draft = self._chain_from_table(int(input_ids[0, -1]), self.num_output_tokens)
+            draft = self._chain_from_table(t2, t1, self.num_output_tokens)
             self.stats["table_rounds"] += 1
             if draft:
                 draft_t = torch.tensor([draft], device=input_ids.device, dtype=input_ids.dtype)
@@ -223,11 +277,11 @@ class StrataCandidateGenerator(PromptLookupCandidateGenerator):
 
 
 # ---------------------------------------------------------------------------
-def enable_strata(table: StrataTable, stats: dict):
+def enable_strata(table: StrataTable, stats: dict, tri: TriTable | None = None):
     """generate() 每次都会按 generation_config 实例化 PromptLookupCandidateGenerator,
     把那个类指向我们的实现即完成注入,验证逻辑全部复用 transformers 的。"""
     def factory(*args, **kwargs):
-        return StrataCandidateGenerator(*args, table=table, stats=stats, **kwargs)
+        return StrataCandidateGenerator(*args, table=table, stats=stats, tri=tri, **kwargs)
 
     gen_utils.PromptLookupCandidateGenerator = factory
 
@@ -248,9 +302,10 @@ def load_model(model_id):
     return model
 
 
-def run_generation(model, processor, messages, gen_kwargs, stats, table=None, cold_table=False):
-    if table is not None and cold_table:
-        table.drop_cache()  # 每轮都从全冷开始:页缓存里一行都没有,全部真回盘
+def run_generation(model, processor, messages, gen_kwargs, stats, tables=None, cold_table=False):
+    if tables and cold_table:
+        for t in tables:
+            t.drop_cache()  # 每轮都从全冷开始:页缓存里一行都没有,全部真回盘
     io_before = proc_io_snapshot()
 
     inputs = processor.apply_chat_template(
@@ -297,22 +352,25 @@ def run_generation(model, processor, messages, gen_kwargs, stats, table=None, co
         print(
             f"[draft] 参与 draft 的验证轮 {stats['drafted_rounds']}"
             f"(prompt 查找 {stats['prompt_rounds']} / 表链 {stats['table_rounds']}"
-            f" / 表补足 {stats['table_refills']}),"
+            f" / 表补足 {stats['table_refills']};链式查询 tri {stats['tri_steps']} 步"
+            f" / bi 回退 {stats['bi_steps']} 步),"
             f" 提出草案 {drafted} 个,采纳 {accepted} 个(接受率 {rate:.0%})"
         )
         print(f"[表] 行读取 {stats['rows_read']:,} | {rows_s:,.0f} rows/s | 显存占用:表不占 VRAM")
 
-    if table is not None:
+    if tables:
         io_after = proc_io_snapshot()
         disk_read = io_after.get("read_bytes", 0) - io_before.get("read_bytes", 0)
         majflt = io_after.get("majflt", 0) - io_before.get("majflt", 0)
-        if table.mode == "mmap":
-            resident = table.resident_bytes()
-            pct = resident / table.size_bytes * 100 if table.size_bytes else 0.0
-            cache_str = f" | 页缓存驻留 {fmt_bytes(resident)}/{fmt_bytes(table.size_bytes)} ({pct:.0f}%)"
-        else:
-            cache_str = " | 读表方式 ram(整表驻内存)"
-        print(f"[IO] 查找表 {fmt_bytes(table.size_bytes)}{cache_str} | 本次生成真实磁盘读 {fmt_bytes(disk_read)} | major fault {majflt}")
+        for t in tables:
+            if t.mode == "mmap":
+                resident = t.resident_bytes()
+                pct = resident / t.size_bytes * 100 if t.size_bytes else 0.0
+                cache_str = f" | 页缓存驻留 {fmt_bytes(resident)}/{fmt_bytes(t.size_bytes)} ({pct:.0f}%)"
+            else:
+                cache_str = " | 读表方式 ram(整表驻内存)"
+            print(f"[IO] {t.label} {fmt_bytes(t.size_bytes)}{cache_str}"
+                  f" | 本次生成真实磁盘读 {fmt_bytes(disk_read)} | major fault {majflt}")
     return reply, n_tok, tok_s
 
 
@@ -320,10 +378,25 @@ def print_vram():
     print(f"[显存] 峰值 {torch.cuda.max_memory_allocated() / 1024**3:.2f} GiB(查找表不占其中)")
 
 
+def load_tables(args):
+    """加载 bigram 表(必需)+ trigram 表(可选;文件不存在则优雅降级只用 bigram)。"""
+    table = StrataTable(args.table, io=args.table_io)
+    tri = None
+    if args.tri_table and os.path.exists(args.tri_table):
+        tri = TriTable(args.tri_table)
+        print(f"[表] {tri.label}已加载: {args.tri_table}({fmt_bytes(tri.size_bytes)},{tri.n:,} 条)")
+    else:
+        print(f"[表] 未找到 trigram 表({args.tri_table}),draft 链只用 bigram;"
+              f"用 build_ngram_table.py --trigram 生成后 --tri-table 指过来")
+    return table, tri
+
+
 def main():
     ap = argparse.ArgumentParser(description="Strata 风格 LFM3-VL chat")
     ap.add_argument("--model", default=DEFAULT_MODEL, help="模型路径或 HF hub id")
-    ap.add_argument("--table", default=TABLE_PATH, help="n-gram 表文件(建议放 SSD)")
+    ap.add_argument("--table", default=TABLE_PATH, help="bigram 表文件(建议放 SSD)")
+    ap.add_argument("--tri-table", default=TRI_TABLE_PATH,
+                    help="trigram 表文件(可选;文件不存在则只用 bigram)")
     ap.add_argument("--table-io", choices=["mmap", "ram"], default="mmap",
                     help="mmap=按需调页(默认);ram=整表进内存")
     ap.add_argument("--draft-k", type=int, default=8, help="每轮最多 draft 的 token 数")
@@ -367,10 +440,11 @@ def main():
             stats = NEW_STATS()
             gen_kwargs = build_kwargs({"prompt_lookup_num_tokens": args.draft_k} if mode == "strata" else None)
             if mode == "strata":
-                table = StrataTable(args.table, io=args.table_io)
-                enable_strata(table, stats)
+                table, tri = load_tables(args)
+                enable_strata(table, stats, tri=tri)
             print(f"\n=== check [{mode}] ===")
-            extra = {"table": table, "cold_table": args.cold_table} if mode == "strata" else {}
+            tables = [t for t in (table, tri) if t] if mode == "strata" else None
+            extra = {"tables": tables, "cold_table": args.cold_table} if mode == "strata" else {}
             reply, _, _ = run_generation(model, processor, make_messages(args.text, bool(args.image)), gen_kwargs, stats, **extra)
             outputs[mode] = reply
             print_vram()
@@ -387,10 +461,11 @@ def main():
             gen_kwargs = build_kwargs(
                 {"prompt_lookup_num_tokens": args.draft_k} if mode != "baseline" else None)
             if mode == "strata":
-                table = StrataTable(args.table, io=args.table_io)
-                enable_strata(table, stats)
+                table, tri = load_tables(args)
+                enable_strata(table, stats, tri=tri)
             print(f"\n=== bench [{mode}] ===")
-            extra = {"table": table, "cold_table": args.cold_table} if mode == "strata" else {}
+            tables = [t for t in (table, tri) if t] if mode == "strata" else None
+            extra = {"tables": tables, "cold_table": args.cold_table} if mode == "strata" else {}
             _, n_tok, tok_s = run_generation(model, processor, make_messages(args.text, bool(args.image)), gen_kwargs, stats, **extra)
             rows.append((mode, n_tok, tok_s))
             print_vram()
@@ -401,17 +476,18 @@ def main():
         return
 
     # --- 默认:单轮或交互 chat ---
-    table = StrataTable(args.table, io=args.table_io) if args.mode == "strata" else None
+    table, tri = load_tables(args) if args.mode == "strata" else (None, None)
     stats = NEW_STATS()
     if table is not None:
-        enable_strata(table, stats)
+        enable_strata(table, stats, tri=tri)
+    tables = [t for t in (table, tri) if t] if table is not None else None
 
     gen_kwargs = build_kwargs({"prompt_lookup_num_tokens": args.draft_k} if args.mode != "baseline" else None)
 
     messages = make_messages(args.text, bool(args.image))
     while True:
         print(f"\n[user] {args.text}")
-        reply, _, _ = run_generation(model, processor, messages, gen_kwargs, stats, table=table, cold_table=args.cold_table)
+        reply, _, _ = run_generation(model, processor, messages, gen_kwargs, stats, tables=tables, cold_table=args.cold_table)
         print_vram()
         if not args.interactive:
             break
