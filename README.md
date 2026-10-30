@@ -59,6 +59,25 @@ python strata_chat.py --bench --greedy --image "" \
 
 一致性:greedy 下 strata 与 baseline 输出逐 token 相同 ✅
 
+### 表的 IO 分层(每次生成结束自动打印 `[IO]` 行)
+
+| 复述任务,greedy,--max-new-tokens 128 | 表热(页缓存自然驻留) | 表冷(`--cold-table`,生成前 fadvise DONTNEED) |
+|---|---|---|
+| strata 生成速度 | 318.8 tok/s | 318.3 tok/s(**不变**) |
+| 查表速度 | 694,595 rows/s | 60,410 rows/s(慢 11.5×,真回盘) |
+| 本次生成真实磁盘读(read_bytes) | 0 B | **1.2 MiB** |
+| 页缓存驻留(生成结束时) | 792 KiB / 3.0 MiB(26%) | 732 KiB / 3.0 MiB(24%) |
+
+三个可以亲眼看到的分层事实:
+
+- 表 3 MB,**只有被查询过的页驻留**(26%——offsets 数组局部 + 少量数据行),
+  其余部分从不进内存;
+- `--cold-table` 丢掉全部缓存后,被查询的页**真的从盘上读了 1.2 MiB**
+  (major fault 计数受内核 fault-around/readahead 记账影响,以 read_bytes 为准);
+- 即便全冷,每轮 draft 只查几十行,回盘开销亚毫秒,**生成速度纹丝不动** ——
+  表读 I/O 从来不是瓶颈,这正是"把最冷的大表留在 SSD"成立的理由;
+  Strata 那张 28.8 GB 的表同样只按行读,只是行数多得多。
+
 ## 结论(与 Strata 文档互相印证)
 
 1. **n-gram draft 只在"重复上下文"的任务上赚**(复述、代码编辑、引用改写):
@@ -67,8 +86,8 @@ python strata_chat.py --bench --greedy --image "" \
 2. **repetition_penalty 是 draft 的天敌**:它压低"上下文里出现过的 token"的
    概率,而 draft 恰恰全是从上下文抄来的,导致草稿在验证阶段全部被拒。
    想看 draft 收益,用 greedy 或去掉惩罚。
-3. **表放 SSD 的代价被 OS 页缓存抹平**:几 MB 的表全部热驻;Strata 的
-   28.8 GB 表才真正需要"每 token 读几行 + 冷行留盘"的分层。
+3. **表放 SSD 的代价被 OS 页缓存抹平**:mmap 按需调页,热行驻内存、冷行留盘,
+   内存吃紧时内核自动逐出。`--cold-table` 可以强制观察全回盘的最冷情形。
 
 ## 文件
 

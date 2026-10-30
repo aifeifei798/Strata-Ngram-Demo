@@ -17,11 +17,13 @@ decoding 的 draft 源,由主模型整批验证 —— 输出与不开 draft 完
     # 3. 实验模式
     python strata_chat.py --check    # greedy 自检:strata 与 baseline 输出逐 token 一致
     python strata_chat.py --bench    # baseline / pld / strata 三模式测速
+    python strata_chat.py --bench --cold-table   # 冷表演示:生成前丢页缓存,观察真实回盘
     python strata_chat.py --bench --greedy --image "" \
         --text "请一字不差地重复下面方括号里的内容:[...一段话...]"   # draft 收益最大的场景
 """
 
 import argparse
+import os
 import time
 from threading import Thread
 
@@ -48,6 +50,60 @@ NEW_STATS = lambda: {"prompt_rounds": 0, "table_rounds": 0, "table_refills": 0,
 
 
 # ---------------------------------------------------------------------------
+# OS 层 IO 统计:把"表在 SSD 上、由页缓存分层"变成可测量的数字
+# ---------------------------------------------------------------------------
+def fmt_bytes(n: float) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if abs(n) < 1024 or unit == "GiB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GiB"
+
+
+def proc_io_snapshot() -> dict:
+    """进程级 IO 计数:read_bytes = 块层真实从存储读的字节;majflt = 真回盘缺页。"""
+    snap = {}
+    try:
+        with open("/proc/self/io") as f:
+            for line in f:
+                key, _, val = line.rstrip().partition(": ")
+                if key in ("rchar", "read_bytes"):
+                    snap[key] = int(val)
+    except OSError:
+        pass
+    try:
+        with open("/proc/self/stat") as f:
+            fields = f.read().rpartition(")")[2].split()
+        snap["minflt"], snap["majflt"] = int(fields[0]), int(fields[1])
+    except (OSError, IndexError, ValueError):
+        pass
+    return snap
+
+
+def file_rss_bytes(path: str) -> int:
+    """该文件当前驻留在页缓存中的字节数(从 /proc/self/smaps 读其映射的 Rss)。"""
+    target = os.path.realpath(path)
+    total = 0
+    try:
+        with open("/proc/self/smaps") as f:
+            in_mapping = False
+            for line in f:
+                head = line.split("-", 1)
+                try:
+                    int(head[0], 16)
+                    is_vma = True  # "addr-addr perm offset dev inode path" 头行
+                except ValueError:
+                    is_vma = False
+                if is_vma:
+                    in_mapping = line.rstrip().endswith(target)
+                elif in_mapping and line.startswith("Rss:"):
+                    total += int(line.split()[1]) * 1024
+    except (OSError, ValueError):
+        pass
+    return total
+
+
+# ---------------------------------------------------------------------------
 # SSD 上的 n-gram 表:mmap 映射,不占显存、零拷贝,按行按需读
 # ---------------------------------------------------------------------------
 class StrataTable:
@@ -64,6 +120,7 @@ class StrataTable:
         if magic != b"STRNTBL1":
             raise ValueError(f"{path} 不是有效的 n-gram 表(magic={magic!r})")
         self.vocab, self.topk, self.path = vocab, topk, path
+        self.mode, self.size_bytes = io, size
 
         if io == "ram":
             # --ple-io ram:整表读进内存,查询走 RAM,不吃页缺失
@@ -90,6 +147,18 @@ class StrataTable:
         if e <= s:
             return []
         return self.rows[s:e][:k].tolist()
+
+    def drop_cache(self):
+        """posix_fadvise DONTNEED:丢弃表的页缓存,模拟 Strata --ple-io direct 的最冷情形。
+        只读映射的页永远是 clean 页,必然可丢弃;之后访问会 major fault 真回盘。"""
+        fd = os.open(self.path, os.O_RDONLY)
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+
+    def resident_bytes(self) -> int:
+        return 0 if self.mode == "ram" else file_rss_bytes(self.path)
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +248,11 @@ def load_model(model_id):
     return model
 
 
-def run_generation(model, processor, messages, gen_kwargs, stats):
+def run_generation(model, processor, messages, gen_kwargs, stats, table=None, cold_table=False):
+    if table is not None and cold_table:
+        table.drop_cache()  # 每轮都从全冷开始:页缓存里一行都没有,全部真回盘
+    io_before = proc_io_snapshot()
+
     inputs = processor.apply_chat_template(
         messages,
         add_generation_prompt=True,
@@ -228,6 +301,18 @@ def run_generation(model, processor, messages, gen_kwargs, stats):
             f" 提出草案 {drafted} 个,采纳 {accepted} 个(接受率 {rate:.0%})"
         )
         print(f"[表] 行读取 {stats['rows_read']:,} | {rows_s:,.0f} rows/s | 显存占用:表不占 VRAM")
+
+    if table is not None:
+        io_after = proc_io_snapshot()
+        disk_read = io_after.get("read_bytes", 0) - io_before.get("read_bytes", 0)
+        majflt = io_after.get("majflt", 0) - io_before.get("majflt", 0)
+        if table.mode == "mmap":
+            resident = table.resident_bytes()
+            pct = resident / table.size_bytes * 100 if table.size_bytes else 0.0
+            cache_str = f" | 页缓存驻留 {fmt_bytes(resident)}/{fmt_bytes(table.size_bytes)} ({pct:.0f}%)"
+        else:
+            cache_str = " | 读表方式 ram(整表驻内存)"
+        print(f"[IO] 查找表 {fmt_bytes(table.size_bytes)}{cache_str} | 本次生成真实磁盘读 {fmt_bytes(disk_read)} | major fault {majflt}")
     return reply, n_tok, tok_s
 
 
@@ -249,6 +334,8 @@ def main():
     ap.add_argument("--max-new-tokens", type=int, default=512)
     ap.add_argument("--interactive", action="store_true", help="多轮交互 chat")
     ap.add_argument("--greedy", action="store_true", help="greedy 采样(repetition penalty 会压制重复 prompt 里的 token,n-gram draft 建议关掉惩罚用 greedy 看效果)")
+    ap.add_argument("--cold-table", action="store_true",
+                    help="每次生成前丢掉表的页缓存(fadvise DONTNEED),演示表完全在 SSD 上的最冷情形")
     ap.add_argument("--check", action="store_true", help="greedy 下验证 strata 输出与 baseline 完全一致")
     ap.add_argument("--bench", action="store_true", help="三种模式各跑一轮并对比 tok/s")
     args = ap.parse_args()
@@ -283,7 +370,8 @@ def main():
                 table = StrataTable(args.table, io=args.table_io)
                 enable_strata(table, stats)
             print(f"\n=== check [{mode}] ===")
-            reply, _, _ = run_generation(model, processor, make_messages(args.text, bool(args.image)), gen_kwargs, stats)
+            extra = {"table": table, "cold_table": args.cold_table} if mode == "strata" else {}
+            reply, _, _ = run_generation(model, processor, make_messages(args.text, bool(args.image)), gen_kwargs, stats, **extra)
             outputs[mode] = reply
             print_vram()
             disable_strata()
@@ -302,7 +390,8 @@ def main():
                 table = StrataTable(args.table, io=args.table_io)
                 enable_strata(table, stats)
             print(f"\n=== bench [{mode}] ===")
-            _, n_tok, tok_s = run_generation(model, processor, make_messages(args.text, bool(args.image)), gen_kwargs, stats)
+            extra = {"table": table, "cold_table": args.cold_table} if mode == "strata" else {}
+            _, n_tok, tok_s = run_generation(model, processor, make_messages(args.text, bool(args.image)), gen_kwargs, stats, **extra)
             rows.append((mode, n_tok, tok_s))
             print_vram()
             disable_strata()
@@ -322,7 +411,7 @@ def main():
     messages = make_messages(args.text, bool(args.image))
     while True:
         print(f"\n[user] {args.text}")
-        reply, _, _ = run_generation(model, processor, messages, gen_kwargs, stats)
+        reply, _, _ = run_generation(model, processor, messages, gen_kwargs, stats, table=table, cold_table=args.cold_table)
         print_vram()
         if not args.interactive:
             break
