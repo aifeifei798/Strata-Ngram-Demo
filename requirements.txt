@@ -1,0 +1,6 @@
+# 实测版本(RTX 5090D / CUDA 13.0);其他相近版本一般也可
+torch>=2.9
+transformers>=5.21
+accelerate>=1.15
+numpy
+pillow

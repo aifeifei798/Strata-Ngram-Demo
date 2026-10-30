@@ -1,0 +1,7 @@
+# 构建产物,不进仓库(用 build_ngram_table.py 从你自己的语料生成)
+strata_ngram.bin
+*.bin
+
+__pycache__/
+*.pyc
+.venv/
